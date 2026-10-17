@@ -123,8 +123,8 @@ if __name__ == "__main__":
 
     # disable warning traces from urllib3
     logging.getLogger('urllib3').setLevel(logging.ERROR)
-    logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
-    logging.getLogger('undetected_chromedriver').setLevel(logging.WARNING)
+    logging.getLogger('websockets').setLevel(logging.WARNING)
+    logging.getLogger('zendriver').setLevel(logging.INFO if log_level == 'DEBUG' else logging.WARNING)
 
     logging.info(f'FlareSolverr {utils.get_flaresolverr_version()}')
     logging.debug('Debug log enabled')
