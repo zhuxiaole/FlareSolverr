@@ -53,13 +53,16 @@ TURNSTILE_SELECTORS = [
 SESSIONS_STORAGE = SessionsStorage()
 
 
-def is_cloudflare_challenge(text: str) -> bool:
+def is_cloudflare_challenge(text: str, page_title: str = "") -> bool:
+    if any(t.lower() == page_title.lower() for t in CHALLENGE_TITLES):
+        return True
     signals = [
-        "cf-turnstile-wrapper",
-        "cf-turnstile-response",
-        "challenges.cloudflare.com",
         "<title>Just a moment...</title>",
         "<title>Checking your browser...</title>",
+        'id="challenge-running"',
+        'id="challenge-stage"',
+        'id="challenge-spinner"',
+        'class="cf-browser-verification"',
         "attendance-card--verify",
         "dev8133_cloudflare"
     ]
@@ -291,18 +294,19 @@ async def _async_resolve_challenge(req: V1RequestBase, browser, method: str) -> 
             logging.debug("Network.setBlockedURLs failed or unsupported: %s", e)
 
     # 2. 页面导航
-    logging.debug(f"Navigating to... {req.url}")
+    target_url = urllib.parse.quote(req.url, safe=":/?#[]@!$&'()*+,;=-_.~")
+    logging.debug(f"Navigating to... {target_url}")
     post_html = None
     if method == "POST":
         post_html = _build_post_html(req)
         await page.get(f"data:text/html;charset=utf-8,{post_html}")
     else:
-        await page.get(req.url)
+        await page.get(target_url)
 
     # 3. 注入 Cookies
     if req.cookies and len(req.cookies) > 0:
         logging.debug("Setting cookies...")
-        parsed = urllib.parse.urlparse(req.url)
+        parsed = urllib.parse.urlparse(target_url)
         default_domain = parsed.hostname or ""
         cookie_params = []
         for c in req.cookies:
@@ -330,7 +334,7 @@ async def _async_resolve_challenge(req: V1RequestBase, browser, method: str) -> 
         if method == "POST":
             await page.get(f"data:text/html;charset=utf-8,{post_html}")
         else:
-            await page.get(req.url)
+            await page.get(target_url)
 
     # 4. 获取初始内容及标题
     await asyncio.sleep(1)
@@ -408,50 +412,33 @@ async def _async_resolve_challenge(req: V1RequestBase, browser, method: str) -> 
             page_title = await page.evaluate("document.title") or ""
 
             has_challenge_title = any(t.lower() == page_title.lower() for t in CHALLENGE_TITLES)
-            has_challenge_selector = any(s in content for s in CHALLENGE_SELECTORS)
-            has_cf_signals = is_cloudflare_challenge(content)
+            has_cf_signals = is_cloudflare_challenge(content, page_title)
+
+            # 核心判定：只有离开质询标题且没有质询特征时，才真正算解盾成功！
+            if not has_challenge_title and not has_cf_signals:
+                logging.info(f"Challenge solved! Final page title: '{page_title}'")
+                res.message = "Challenge solved!"
+                break
 
             cookies_now = await browser.cookies.get_all()
             has_cf_clearance = any(c.name == "cf_clearance" for c in cookies_now)
 
-            if not has_challenge_title and not has_challenge_selector and not has_cf_signals:
-                logging.info(f"Challenge solved! Final page title: '{page_title}'")
-                res.message = "Challenge solved!"
-                break
-            elif has_cf_clearance:
-                logging.debug("cf_clearance obtained, waiting for page to navigate to target...")
-                redirected = False
-                for _ in range(8):
-                    await asyncio.sleep(1)
-                    content = await page.get_content()
-                    page_title = await page.evaluate("document.title") or ""
-                    has_challenge_title = any(t.lower() == page_title.lower() for t in CHALLENGE_TITLES)
-                    has_challenge_selector = any(s in content for s in CHALLENGE_SELECTORS)
-                    has_cf_signals = is_cloudflare_challenge(content)
-                    if not has_challenge_title and not has_challenge_selector and not has_cf_signals:
-                        redirected = True
-                        break
+            if has_cf_clearance and attempt >= 2:
+                # 已拿到 cf_clearance 但页面长时间停滞未自动跳转，主动带盾刷新重试
+                logging.debug("cf_clearance present, reloading target URL...")
+                if method == "POST":
+                    await page.get(f"data:text/html;charset=utf-8,{post_html}")
+                else:
+                    await page.get(target_url)
+                await asyncio.sleep(2)
+                content = await page.get_content()
+                page_title = await page.evaluate("document.title") or ""
+                if not any(t.lower() == page_title.lower() for t in CHALLENGE_TITLES) and not is_cloudflare_challenge(content, page_title):
+                    logging.info(f"Challenge solved after reload! Final page title: '{page_title}'")
+                    res.message = "Challenge solved!"
+                    break
 
-                if not redirected:
-                    # 页面未在预期时间内自动跳转，携带新鲜的 cf_clearance 主动重新加载目标 URL
-                    logging.info("Page did not redirect automatically, reloading target URL with clearance...")
-                    if method == "POST":
-                        await page.get(f"data:text/html;charset=utf-8,{post_html}")
-                    else:
-                        await page.get(req.url)
-                    await asyncio.sleep(2)
-                    content = await page.get_content()
-                    page_title = await page.evaluate("document.title") or ""
-
-                logging.info(f"Challenge solved! Final page title: '{page_title}'")
-                res.message = "Challenge solved!"
-                break
-            elif "attendance-card--done" in content:
-                logging.info(f"Challenge solved (card done)! Final page title: '{page_title}'")
-                res.message = "Challenge solved!"
-                break
-
-            logging.debug(f"Waiting for challenge resolution (attempt {attempt}, title={page_title})")
+            logging.debug(f"Waiting for challenge resolution (attempt {attempt}, title='{page_title}')")
     else:
         logging.info("Challenge not detected!")
         res.message = "Challenge not detected!"
