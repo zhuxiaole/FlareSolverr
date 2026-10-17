@@ -415,11 +415,39 @@ async def _async_resolve_challenge(req: V1RequestBase, browser, method: str) -> 
             has_cf_clearance = any(c.name == "cf_clearance" for c in cookies_now)
 
             if not has_challenge_title and not has_challenge_selector and not has_cf_signals:
-                logging.info("Challenge solved!")
+                logging.info(f"Challenge solved! Final page title: '{page_title}'")
                 res.message = "Challenge solved!"
                 break
-            elif has_cf_clearance or "attendance-card--done" in content:
-                logging.info("Challenge solved (verified by token/clearance)!")
+            elif has_cf_clearance:
+                logging.debug("cf_clearance obtained, waiting for page to navigate to target...")
+                redirected = False
+                for _ in range(8):
+                    await asyncio.sleep(1)
+                    content = await page.get_content()
+                    page_title = await page.evaluate("document.title") or ""
+                    has_challenge_title = any(t.lower() == page_title.lower() for t in CHALLENGE_TITLES)
+                    has_challenge_selector = any(s in content for s in CHALLENGE_SELECTORS)
+                    has_cf_signals = is_cloudflare_challenge(content)
+                    if not has_challenge_title and not has_challenge_selector and not has_cf_signals:
+                        redirected = True
+                        break
+
+                if not redirected:
+                    # 页面未在预期时间内自动跳转，携带新鲜的 cf_clearance 主动重新加载目标 URL
+                    logging.info("Page did not redirect automatically, reloading target URL with clearance...")
+                    if method == "POST":
+                        await page.get(f"data:text/html;charset=utf-8,{post_html}")
+                    else:
+                        await page.get(req.url)
+                    await asyncio.sleep(2)
+                    content = await page.get_content()
+                    page_title = await page.evaluate("document.title") or ""
+
+                logging.info(f"Challenge solved! Final page title: '{page_title}'")
+                res.message = "Challenge solved!"
+                break
+            elif "attendance-card--done" in content:
+                logging.info(f"Challenge solved (card done)! Final page title: '{page_title}'")
                 res.message = "Challenge solved!"
                 break
 
@@ -456,8 +484,18 @@ async def _async_resolve_challenge(req: V1RequestBase, browser, method: str) -> 
     cookies_list = []
     for c in all_cookies:
         c_dict = c.to_json()
-        if "expires" in c_dict and "expiry" not in c_dict:
-            c_dict["expiry"] = c_dict["expires"]
+        # session cookie 处理：若 expires <= 0 则删除，避免 .NET (Jackett) 将其解析为 1969 年并判定为已过期丢弃
+        if c_dict.get("expires") is not None:
+            if c_dict["expires"] > 0:
+                c_dict["expiry"] = int(c_dict["expires"])
+            else:
+                del c_dict["expires"]
+        if "expiry" in c_dict and c_dict["expiry"] <= 0:
+            del c_dict["expiry"]
+
+        if c_dict.get("sameSite"):
+            c_dict["sameSite"] = c_dict["sameSite"].capitalize()
+
         cookies_list.append(c_dict)
     challenge_res.cookies = cookies_list
 

@@ -70,6 +70,16 @@ def get_event_loop() -> asyncio.AbstractEventLoop:
     with _loop_lock:
         if _loop is None or _loop.is_closed():
             _loop = asyncio.new_event_loop()
+
+            def _loop_exception_handler(loop, context):
+                exc = context.get("exception")
+                if isinstance(exc, (ValueError, ConnectionResetError)) and "websocket" in str(exc).lower():
+                    return
+                if isinstance(exc, asyncio.CancelledError):
+                    return
+                loop.default_exception_handler(context)
+
+            _loop.set_exception_handler(_loop_exception_handler)
             _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True, name="zendriver_loop")
             _loop_thread.start()
         return _loop
